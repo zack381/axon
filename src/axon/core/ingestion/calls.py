@@ -147,7 +147,16 @@ def resolve_call(
         if result is not None:
             return result, 0.9
 
-    # Without type info the receiver doesn't help — fall through to name-based resolution.
+    if receiver == "static":
+        # PHP late static binding — try same-class first (like self::),
+        # then walk EXTENDS chain (like parent::).
+        result = _resolve_self_method(name, file_path, call_index, graph)
+        if result is not None:
+            return result, 1.0
+        result = _resolve_parent_method(name, file_path, call_index, graph)
+        if result is not None:
+            return result, 0.9
+
     candidate_ids = call_index.get(name, [])
     if not candidate_ids:
         return None, 0.0
@@ -163,7 +172,19 @@ def resolve_call(
     if imported_target is not None:
         return imported_target, 1.0
 
-    # 3. Global fuzzy match -- prefer path proximity to caller, then shortest path.
+    # 3. Receiver-qualified match — if we know the class name, prefer matching
+    #    METHOD nodes with that class_name over a bare global fuzzy match.
+    if receiver and receiver not in ("self", "this", "parent", "super", "static"):
+        for nid in candidate_ids:
+            node = graph.get_node(nid)
+            if (
+                node is not None
+                and node.label == NodeLabel.METHOD
+                and node.class_name == receiver
+            ):
+                return nid, 0.8
+
+    # 4. Global fuzzy match -- prefer path proximity to caller, then shortest path.
     return _pick_closest(candidate_ids, file_path, graph), 0.5
 
 def _resolve_same_file(
@@ -533,7 +554,7 @@ def process_calls(
             # Receiver: link to the class and resolve the method on it.
             if not is_blocklisted:
                 receiver = call.receiver
-                if receiver and receiver not in ("self", "this"):
+                if receiver and receiver not in ("self", "this", "parent", "super", "static"):
                     receiver_call = CallInfo(name=receiver, line=call.line)
                     recv_id, recv_conf = resolve_call(
                         receiver_call, fpd.file_path, call_index, graph
