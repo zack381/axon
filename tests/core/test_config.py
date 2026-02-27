@@ -139,7 +139,16 @@ class TestGetLanguage:
         assert get_language("components/App.ts") == "typescript"
 
     def test_typescript_tsx(self) -> None:
-        assert get_language("components/App.tsx") == "typescript"
+        assert get_language("components/App.tsx") == "tsx"
+
+    def test_php(self) -> None:
+        assert get_language("app/Models/User.php") == "php"
+
+    def test_html(self) -> None:
+        assert get_language("views/index.html") == "html"
+
+    def test_html_htm(self) -> None:
+        assert get_language("views/page.htm") == "html"
 
     def test_javascript_js(self) -> None:
         assert get_language("index.js") == "javascript"

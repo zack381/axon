@@ -7,11 +7,14 @@ from pathlib import Path
 SUPPORTED_EXTENSIONS: dict[str, str] = {
     ".py": "python",
     ".ts": "typescript",
-    ".tsx": "typescript",
+    ".tsx": "tsx",
     ".js": "javascript",
     ".jsx": "javascript",
     ".mjs": "javascript",
     ".cjs": "javascript",
+    ".php": "php",
+    ".html": "html",
+    ".htm": "html",
 }
 
 def get_language(file_path: str | Path) -> str | None:

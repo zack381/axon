@@ -1,0 +1,842 @@
+"""PHP parser using tree-sitter.
+
+Extracts symbols (functions, classes, methods, interfaces, enums),
+imports (use statements), call expressions, type annotation references,
+and heritage (extends / implements) relationships from PHP source files.
+"""
+
+from __future__ import annotations
+
+import tree_sitter_php as tsphp
+from tree_sitter import Language, Node, Parser
+
+from axon.core.parsers.base import (
+    CallInfo,
+    ImportInfo,
+    LanguageParser,
+    ParseResult,
+    SymbolInfo,
+    TypeRef,
+)
+
+PHP_LANGUAGE = Language(tsphp.language_php())
+
+_BUILTIN_TYPES: frozenset[str] = frozenset({
+    "string", "int", "float", "bool", "array", "object", "null",
+    "void", "never", "mixed", "callable", "iterable", "self",
+    "static", "parent", "true", "false",
+})
+
+_MAGIC_METHODS: frozenset[str] = frozenset({
+    "__construct", "__destruct", "__call", "__callStatic", "__get",
+    "__set", "__isset", "__unset", "__sleep", "__wakeup", "__serialize",
+    "__unserialize", "__toString", "__invoke", "__set_state", "__clone",
+    "__debugInfo",
+})
+
+
+class PhpParser(LanguageParser):
+    """Parse PHP source files via tree-sitter."""
+
+    def __init__(self) -> None:
+        self._parser = Parser(PHP_LANGUAGE)
+
+    def parse(self, content: str, file_path: str) -> ParseResult:
+        """Parse PHP source and return structured information."""
+        tree = self._parser.parse(content.encode("utf-8"))
+        result = ParseResult()
+        # Track $var = functionCall() assignments for type inference.
+        var_assignments: dict[str, str] = {}  # var_name -> called_function_name
+        # Track current namespace declaration.
+        namespace: list[str] = [""]  # mutable container for _walk
+        self._walk(tree.root_node, content, result, var_assignments=var_assignments, namespace=namespace)
+        self._resolve_variable_types(result, var_assignments)
+        self._resolve_string_method_refs(tree.root_node, result)
+        return result
+
+    def _walk(
+        self, node: Node, source: str, result: ParseResult,
+        visited: set[int] | None = None,
+        var_assignments: dict[str, str] | None = None,
+        namespace: list[str] | None = None,
+    ) -> None:
+        """Recursively walk the AST to extract definitions, imports, and calls.
+
+        Uses a *visited* set to avoid processing the same subtree twice.
+        Recurses into **all** children by default so that nested expressions
+        (e.g. calls inside function arguments) are never missed.
+        """
+        if visited is None:
+            visited = set()
+        if namespace is None:
+            namespace = [""]
+
+        node_key = node.id
+        if node_key in visited:
+            return
+        visited.add(node_key)
+
+        ntype = node.type
+
+        if ntype == "namespace_definition":
+            self._extract_namespace(node, namespace)
+        elif ntype == "function_definition":
+            self._extract_function(node, source, result, namespace=namespace[0])
+        elif ntype == "class_declaration":
+            self._extract_class(node, source, result, namespace=namespace[0])
+        elif ntype == "interface_declaration":
+            self._extract_interface(node, source, result, namespace=namespace[0])
+        elif ntype == "enum_declaration":
+            self._extract_enum(node, source, result, namespace=namespace[0])
+        elif ntype == "trait_declaration":
+            self._extract_trait(node, source, result, namespace=namespace[0])
+        elif ntype == "use_declaration":
+            self._extract_trait_use(node, result)
+        elif ntype == "method_declaration":
+            self._extract_method(node, source, result, namespace=namespace[0])
+        elif ntype == "namespace_use_declaration":
+            self._extract_use(node, result)
+        elif ntype == "function_call_expression":
+            self._extract_function_call(node, result)
+        elif ntype == "member_call_expression":
+            self._extract_member_call(node, result)
+        elif ntype == "scoped_call_expression":
+            self._extract_scoped_call(node, result)
+        elif ntype == "object_creation_expression":
+            self._extract_new_expression(node, result)
+        elif ntype in ("require_expression", "require_once_expression",
+                       "include_expression", "include_once_expression"):
+            self._extract_include(node, result)
+        elif ntype == "assignment_expression" and var_assignments is not None:
+            self._extract_assignment(node, var_assignments)
+
+        # Universal recursion into all children.
+        for child in node.children:
+            self._walk(child, source, result, visited, var_assignments, namespace)
+
+    @staticmethod
+    def _extract_namespace(node: Node, namespace: list[str]) -> None:
+        """Extract ``namespace App\\Services;`` and store in the mutable container."""
+        for child in node.children:
+            if child.type == "namespace_name":
+                namespace[0] = child.text.decode()
+                return
+
+    def _extract_function(
+        self, node: Node, source: str, result: ParseResult,
+        namespace: str = "",
+    ) -> None:
+        """Extract a top-level function definition."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+
+        name = name_node.text.decode()
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        content = node.text.decode()
+        signature = self._build_signature(node, name)
+
+        result.symbols.append(
+            SymbolInfo(
+                name=name,
+                kind="function",
+                start_line=start_line,
+                end_line=end_line,
+                content=content,
+                signature=signature,
+                namespace=namespace,
+            )
+        )
+
+        self._extract_param_types(node, result)
+        self._extract_return_type(node, result)
+
+    def _extract_class(
+        self, node: Node, source: str, result: ParseResult,
+        namespace: str = "",
+    ) -> None:
+        """Extract a class declaration with heritage."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+
+        class_name = name_node.text.decode()
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        content = node.text.decode()
+
+        result.symbols.append(
+            SymbolInfo(
+                name=class_name,
+                kind="class",
+                start_line=start_line,
+                end_line=end_line,
+                content=content,
+                namespace=namespace,
+            )
+        )
+
+        # Extract extends and implements
+        for child in node.children:
+            if child.type == "base_clause":
+                for sub in child.children:
+                    if sub.type == "name":
+                        result.heritage.append((class_name, "extends", sub.text.decode()))
+                    elif sub.type == "qualified_name":
+                        result.heritage.append((class_name, "extends", self._qualified_name(sub)))
+            elif child.type == "class_interface_clause":
+                for sub in child.children:
+                    if sub.type == "name":
+                        result.heritage.append((class_name, "implements", sub.text.decode()))
+                    elif sub.type == "qualified_name":
+                        result.heritage.append((class_name, "implements", self._qualified_name(sub)))
+
+    def _extract_interface(
+        self, node: Node, source: str, result: ParseResult,
+        namespace: str = "",
+    ) -> None:
+        """Extract an interface declaration."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+
+        name = name_node.text.decode()
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        content = node.text.decode()
+
+        result.symbols.append(
+            SymbolInfo(
+                name=name,
+                kind="interface",
+                start_line=start_line,
+                end_line=end_line,
+                content=content,
+                namespace=namespace,
+            )
+        )
+
+        # Extract extends (interfaces can extend other interfaces)
+        for child in node.children:
+            if child.type == "base_clause":
+                for sub in child.children:
+                    if sub.type == "name":
+                        result.heritage.append((name, "extends", sub.text.decode()))
+
+    def _extract_enum(
+        self, node: Node, source: str, result: ParseResult,
+        namespace: str = "",
+    ) -> None:
+        """Extract a PHP 8.1+ enum declaration."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+
+        name = name_node.text.decode()
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        content = node.text.decode()
+
+        result.symbols.append(
+            SymbolInfo(
+                name=name,
+                kind="enum",
+                start_line=start_line,
+                end_line=end_line,
+                content=content,
+                namespace=namespace,
+            )
+        )
+
+    def _extract_trait(
+        self, node: Node, source: str, result: ParseResult,
+        namespace: str = "",
+    ) -> None:
+        """Extract a trait declaration (treated like a class for graph purposes)."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+
+        name = name_node.text.decode()
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        content = node.text.decode()
+
+        result.symbols.append(
+            SymbolInfo(
+                name=name,
+                kind="class",  # traits are class-like in the graph
+                start_line=start_line,
+                end_line=end_line,
+                content=content,
+                namespace=namespace,
+            )
+        )
+
+    def _extract_trait_use(self, node: Node, result: ParseResult) -> None:
+        """Extract ``use TraitName;`` inside a class body as heritage.
+
+        ``use Loggable, Cacheable;`` produces heritage entries similar
+        to ``implements``, allowing trait methods to be resolved when
+        called via ``$this->method()``.
+        """
+        class_name = self._find_parent_class_name(node)
+        if not class_name:
+            return
+
+        for child in node.children:
+            if child.type == "name":
+                trait_name = child.text.decode()
+                result.heritage.append((class_name, "extends", trait_name))
+            elif child.type == "qualified_name":
+                trait_name = self._qualified_name(child)
+                short = trait_name.rsplit("\\", 1)[-1] if "\\" in trait_name else trait_name
+                result.heritage.append((class_name, "extends", short))
+
+    def _extract_method(
+        self, node: Node, source: str, result: ParseResult,
+        namespace: str = "",
+    ) -> None:
+        """Extract a method declaration inside a class, interface, or trait."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+
+        name = name_node.text.decode()
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        content = node.text.decode()
+        signature = self._build_signature(node, name)
+        class_name = self._find_parent_class_name(node)
+
+        result.symbols.append(
+            SymbolInfo(
+                name=name,
+                kind="method",
+                start_line=start_line,
+                end_line=end_line,
+                content=content,
+                signature=signature,
+                class_name=class_name,
+                namespace=namespace,
+            )
+        )
+
+        self._extract_param_types(node, result)
+        self._extract_return_type(node, result)
+
+    def _extract_use(self, node: Node, result: ParseResult) -> None:
+        """Extract a ``use`` statement (namespace import)."""
+        # For grouped use: capture the namespace prefix (sibling of the group node).
+        prefix = ""
+        for child in node.children:
+            if child.type == "namespace_name":
+                prefix = child.text.decode()
+            elif child.type == "namespace_use_clause":
+                qname_node = None
+                alias = ""
+                saw_as = False
+                for sub in child.children:
+                    if sub.type == "qualified_name":
+                        qname_node = sub
+                    elif sub.type == "namespace_aliasing_clause":
+                        for alias_child in sub.children:
+                            if alias_child.type == "name":
+                                alias = alias_child.text.decode()
+                    elif sub.type == "as":
+                        saw_as = True
+                    elif sub.type == "name" and saw_as:
+                        alias = sub.text.decode()
+
+                if qname_node is not None:
+                    full_name = self._qualified_name(qname_node)
+                    # The imported name is the last segment (e.g., "UserService" from "App\Services\UserService")
+                    parts = full_name.replace("\\", "/").split("/")
+                    short_name = alias or parts[-1]
+                    result.imports.append(
+                        ImportInfo(
+                            module=full_name,
+                            names=[short_name],
+                            is_relative=False,
+                            alias=alias,
+                        )
+                    )
+            elif child.type == "namespace_use_group":
+                # use App\Models\{User, Role};
+                # The group contains namespace_use_clause children directly.
+                # The prefix (e.g. "App\Models") was captured above from
+                # the sibling namespace_name node.
+                for sub in child.children:
+                    if sub.type == "namespace_use_clause":
+                        for inner in sub.children:
+                            if inner.type == "name":
+                                name = inner.text.decode()
+                                full = f"{prefix}\\{name}" if prefix else name
+                                result.imports.append(
+                                    ImportInfo(
+                                        module=full,
+                                        names=[name],
+                                        is_relative=False,
+                                    )
+                                )
+
+    # PHP functions that take a callable as a string argument.
+    _CALLBACK_FUNCTIONS: frozenset[str] = frozenset({
+        "register_shutdown_function", "call_user_func", "call_user_func_array",
+        "set_error_handler", "set_exception_handler", "spl_autoload_register",
+    })
+
+    def _extract_function_call(self, node: Node, result: ParseResult) -> None:
+        """Extract a function call expression."""
+        func_node = node.child_by_field_name("function")
+        if func_node is None:
+            return
+
+        line = node.start_point[0] + 1
+        arguments = self._extract_identifier_arguments(node)
+
+        func_name = ""
+        if func_node.type == "name":
+            func_name = func_node.text.decode()
+            result.calls.append(
+                CallInfo(name=func_name, line=line, arguments=arguments)
+            )
+        elif func_node.type == "qualified_name":
+            name = self._qualified_name(func_node)
+            func_name = name.rsplit("\\", 1)[-1] if "\\" in name else name
+            result.calls.append(
+                CallInfo(name=func_name, line=line, arguments=arguments)
+            )
+
+        # For known callback-registration functions, extract string literal
+        # arguments as synthetic calls (e.g. register_shutdown_function('handler')).
+        if func_name in self._CALLBACK_FUNCTIONS:
+            for cb_name in self._extract_string_arguments(node):
+                result.calls.append(CallInfo(name=cb_name, line=line))
+
+    def _extract_member_call(self, node: Node, result: ParseResult) -> None:
+        """Extract ``$obj->method()`` calls."""
+        name_node = node.child_by_field_name("name")
+        obj_node = node.child_by_field_name("object")
+        if name_node is None:
+            return
+
+        line = node.start_point[0] + 1
+        method_name = name_node.text.decode()
+        receiver = ""
+        if obj_node is not None:
+            receiver = obj_node.text.decode().lstrip("$")
+
+        result.calls.append(
+            CallInfo(name=method_name, line=line, receiver=receiver)
+        )
+
+    def _extract_scoped_call(self, node: Node, result: ParseResult) -> None:
+        """Extract ``ClassName::method()`` (static calls)."""
+        name_node = node.child_by_field_name("name")
+        scope_node = node.child_by_field_name("scope")
+        if name_node is None:
+            return
+
+        line = node.start_point[0] + 1
+        method_name = name_node.text.decode()
+        receiver = scope_node.text.decode() if scope_node else ""
+
+        result.calls.append(
+            CallInfo(name=method_name, line=line, receiver=receiver)
+        )
+
+    def _extract_new_expression(self, node: Node, result: ParseResult) -> None:
+        """Extract ``new ClassName(...)`` — emit a call to the class."""
+        for child in node.children:
+            if child.type == "name":
+                result.calls.append(
+                    CallInfo(name=child.text.decode(), line=node.start_point[0] + 1)
+                )
+                break
+            elif child.type == "qualified_name":
+                name = self._qualified_name(child)
+                short = name.rsplit("\\", 1)[-1] if "\\" in name else name
+                result.calls.append(
+                    CallInfo(name=short, line=node.start_point[0] + 1)
+                )
+                break
+
+    def _extract_param_types(self, func_node: Node, result: ParseResult) -> None:
+        """Extract type hints from function/method parameters."""
+        params = func_node.child_by_field_name("parameters")
+        if params is None:
+            return
+
+        for param in params.children:
+            if param.type == "simple_parameter":
+                self._extract_param_type(param, result)
+
+    def _extract_param_type(self, param_node: Node, result: ParseResult) -> None:
+        """Extract a single parameter's type hint."""
+        param_name = ""
+        type_name = ""
+
+        for child in param_node.children:
+            if child.type == "variable_name":
+                # Get the name without $
+                for sub in child.children:
+                    if sub.type == "name":
+                        param_name = sub.text.decode()
+            elif child.type in ("named_type", "optional_type"):
+                type_name = self._extract_type_name_from_node(child)
+            elif child.type == "primitive_type":
+                type_name = child.text.decode()
+
+        if type_name and type_name.lower() not in _BUILTIN_TYPES:
+            result.type_refs.append(
+                TypeRef(
+                    name=type_name,
+                    kind="param",
+                    line=param_node.start_point[0] + 1,
+                    param_name=param_name,
+                )
+            )
+
+    def _extract_return_type(self, func_node: Node, result: ParseResult) -> None:
+        """Extract return type hint from a function/method."""
+        for child in func_node.children:
+            if child.type in ("named_type", "optional_type"):
+                type_name = self._extract_type_name_from_node(child)
+                if type_name and type_name.lower() not in _BUILTIN_TYPES:
+                    result.type_refs.append(
+                        TypeRef(
+                            name=type_name,
+                            kind="return",
+                            line=child.start_point[0] + 1,
+                        )
+                    )
+            elif child.type == "union_type":
+                # Handle union return types like LinqClient|BlueBubblesClient.
+                for sub in child.children:
+                    if sub.type in ("named_type", "optional_type"):
+                        type_name = self._extract_type_name_from_node(sub)
+                        if type_name and type_name.lower() not in _BUILTIN_TYPES:
+                            result.type_refs.append(
+                                TypeRef(
+                                    name=type_name,
+                                    kind="return",
+                                    line=sub.start_point[0] + 1,
+                                )
+                            )
+            elif child.type == "primitive_type":
+                pass  # Skip built-in return types
+
+    @staticmethod
+    def _extract_type_name_from_node(type_node: Node) -> str:
+        """Extract a type name from a named_type or optional_type node."""
+        for child in type_node.children:
+            if child.type == "name":
+                return child.text.decode()
+            elif child.type == "qualified_name":
+                text = child.text.decode()
+                return text.rsplit("\\", 1)[-1] if "\\" in text else text
+            elif child.type == "named_type":
+                return PhpParser._extract_type_name_from_node(child)
+        return type_node.text.decode()
+
+    @staticmethod
+    def _qualified_name(node: Node) -> str:
+        """Build a qualified name string from a qualified_name node."""
+        parts: list[str] = []
+        for child in node.children:
+            if child.type == "namespace_name":
+                for sub in child.children:
+                    if sub.type == "name":
+                        parts.append(sub.text.decode())
+            elif child.type == "name":
+                parts.append(child.text.decode())
+        return "\\".join(parts)
+
+    @staticmethod
+    def _find_parent_class_name(node: Node) -> str:
+        """Walk up the tree to find the enclosing class, interface, or trait name."""
+        current = node.parent
+        while current is not None:
+            if current.type in ("class_declaration", "interface_declaration", "trait_declaration"):
+                name_node = current.child_by_field_name("name")
+                if name_node is not None:
+                    return name_node.text.decode()
+            current = current.parent
+        return ""
+
+    @staticmethod
+    def _build_signature(node: Node, name: str) -> str:
+        """Build a human-readable signature for a function/method."""
+        params_node = node.child_by_field_name("parameters")
+        params_text = params_node.text.decode() if params_node else "()"
+
+        return_type = ""
+        for child in node.children:
+            if child.type in ("named_type", "optional_type", "primitive_type"):
+                # Check it comes after the parameters (return type position)
+                if params_node and child.start_byte > params_node.end_byte:
+                    return_type = child.text.decode()
+                    break
+
+        sig = f"function {name}{params_text}"
+        if return_type:
+            sig += f": {return_type}"
+        return sig
+
+    @staticmethod
+    def _extract_assignment(
+        node: Node, var_assignments: dict[str, str]
+    ) -> None:
+        """Track ``$var = functionCall()`` and ``$var = new ClassName()``.
+
+        Populates *var_assignments* with ``{var_name: function_or_class_name}``
+        so that later ``$var->method()`` calls can be resolved via the
+        function's return type or the class name.
+        """
+        left = node.child_by_field_name("left")
+        right = node.child_by_field_name("right")
+        if left is None or right is None:
+            return
+
+        # LHS must be a simple variable ($var, not $obj->prop).
+        if left.type != "variable_name":
+            return
+        var_name = ""
+        for child in left.children:
+            if child.type == "name":
+                var_name = child.text.decode()
+        if not var_name:
+            return
+
+        # RHS: function_call_expression → track the called function name.
+        if right.type == "function_call_expression":
+            func_node = right.child_by_field_name("function")
+            if func_node is not None:
+                if func_node.type == "name":
+                    var_assignments[var_name] = func_node.text.decode()
+                elif func_node.type == "qualified_name":
+                    text = func_node.text.decode()
+                    var_assignments[var_name] = text.rsplit("\\", 1)[-1] if "\\" in text else text
+
+        # RHS: new ClassName() → variable type is the class directly.
+        elif right.type == "object_creation_expression":
+            for child in right.children:
+                if child.type == "name":
+                    var_assignments[var_name] = f"__new__{child.text.decode()}"
+                    break
+                elif child.type == "qualified_name":
+                    text = child.text.decode()
+                    short = text.rsplit("\\", 1)[-1] if "\\" in text else text
+                    var_assignments[var_name] = f"__new__{short}"
+                    break
+
+    @staticmethod
+    def _resolve_variable_types(
+        result: ParseResult, var_assignments: dict[str, str]
+    ) -> None:
+        """Build ``result.variable_types`` from assignments and return type hints.
+
+        For ``$client = getMessagingClient()`` where ``getMessagingClient``
+        has return type ``LinqClient|BlueBubblesClient``, produces:
+        ``{"client": ["LinqClient", "BlueBubblesClient"]}``.
+
+        For ``$client = new LinqClient()`` produces:
+        ``{"client": ["LinqClient"]}``.
+
+        Unresolved function-call assignments (where the function is defined
+        in another file) are stored as ``["__call__functionName"]`` sentinel
+        values for cross-file resolution during the call-resolution phase.
+        """
+        if not var_assignments:
+            return
+
+        # Build function_name -> [return_type_names] from same-file type_refs.
+        func_return_types: dict[str, list[str]] = {}
+        for sym in result.symbols:
+            if sym.kind == "function":
+                func_return_types[sym.name] = []
+        for tref in result.type_refs:
+            if tref.kind == "return":
+                for sym in result.symbols:
+                    if sym.kind == "function" and sym.start_line <= tref.line <= sym.end_line:
+                        func_return_types.setdefault(sym.name, []).append(tref.name)
+                        break
+
+        for var_name, source_name in var_assignments.items():
+            # Direct constructor: $var = new ClassName()
+            if source_name.startswith("__new__"):
+                class_name = source_name[7:]
+                result.variable_types[var_name] = [class_name]
+                continue
+
+            # Factory function: $var = getFactory()
+            return_types = func_return_types.get(source_name)
+            if return_types:
+                result.variable_types[var_name] = return_types
+            else:
+                # Function not defined in this file — store a sentinel
+                # for cross-file resolution in the call-resolution phase.
+                result.variable_types[var_name] = [f"__call__{source_name}"]
+
+    @staticmethod
+    def _resolve_string_method_refs(root: Node, result: ParseResult) -> None:
+        """Emit synthetic calls for string literals that match method names.
+
+        Handles the PHP dynamic-dispatch pattern where class property arrays
+        contain method name strings used via ``$this->$method()``:
+
+        .. code-block:: php
+
+            private $patterns = ['replace_callback' => 'fixSqlInjection'];
+            // later: $this->$method($code, $match);
+
+        Collects all string literals within class ``property_declaration``
+        nodes, then emits a :class:`CallInfo` for each string that matches
+        a method name defined in the same class.
+        """
+        # Build set of method names per class.
+        class_methods: dict[str, set[str]] = {}
+        for sym in result.symbols:
+            if sym.kind == "method" and sym.class_name:
+                class_methods.setdefault(sym.class_name, set()).add(sym.name)
+
+        if not class_methods:
+            return
+
+        # Collect string literals from class property initializers.
+        def _collect_property_strings(node: Node) -> list[tuple[str, int]]:
+            """Collect (string_value, line) pairs from property declarations."""
+            strings: list[tuple[str, int]] = []
+            if node.type == "string_content":
+                text = node.text.decode()
+                if text.isidentifier() and not text.startswith("__"):
+                    strings.append((text, node.start_point[0] + 1))
+            for child in node.children:
+                strings.extend(_collect_property_strings(child))
+            return strings
+
+        # Walk class declarations looking for property arrays.
+        def _walk_classes(node: Node) -> None:
+            if node.type == "class_declaration":
+                name_node = node.child_by_field_name("name")
+                if name_node is None:
+                    return
+                class_name = name_node.text.decode()
+                methods = class_methods.get(class_name, set())
+                if not methods:
+                    return
+
+                for child in node.children:
+                    if child.type == "declaration_list":
+                        for member in child.children:
+                            if member.type == "property_declaration":
+                                for s, line in _collect_property_strings(member):
+                                    if s in methods:
+                                        result.calls.append(
+                                            CallInfo(
+                                                name=s,
+                                                line=line,
+                                                receiver="this",
+                                            )
+                                        )
+            for child in node.children:
+                _walk_classes(child)
+
+        _walk_classes(root)
+
+    def _extract_include(self, node: Node, result: ParseResult) -> None:
+        """Extract ``require_once``, ``include``, etc. as import references.
+
+        Handles simple string paths like ``require_once "config.php"`` and
+        ``__DIR__ . "/helpers/utils.php"`` concatenation patterns.
+        """
+        path = self._extract_include_path(node)
+        if not path:
+            return
+
+        # Normalize: strip leading / and ./ then collapse /../ sequences.
+        # __DIR__ . '/helpers/utils.php' → 'helpers/utils.php'
+        # __DIR__ . '/../config.php' → '../config.php'
+        import posixpath
+        path = path.lstrip("/")
+        path = posixpath.normpath(path)
+        if path.startswith("./"):
+            path = path[2:]
+
+        result.imports.append(
+            ImportInfo(
+                module=path,
+                names=[],
+                is_relative=True,
+            )
+        )
+
+    @staticmethod
+    def _extract_include_path(node: Node) -> str:
+        """Extract the file path string from an include/require node."""
+        for child in node.children:
+            if child.type == "encapsed_string":
+                for sub in child.children:
+                    if sub.type == "string_content":
+                        return sub.text.decode()
+            elif child.type == "string":
+                for sub in child.children:
+                    if sub.type == "string_content":
+                        return sub.text.decode()
+            elif child.type == "binary_expression":
+                # Handle __DIR__ . "/path/to/file.php"
+                for sub in child.children:
+                    if sub.type == "encapsed_string":
+                        for inner in sub.children:
+                            if inner.type == "string_content":
+                                return inner.text.decode()
+                    elif sub.type == "string":
+                        for inner in sub.children:
+                            if inner.type == "string_content":
+                                return inner.text.decode()
+        return ""
+
+    @staticmethod
+    def _extract_identifier_arguments(call_node: Node) -> list[str]:
+        """Extract bare identifier/variable arguments from a call."""
+        args_node = call_node.child_by_field_name("arguments")
+        if args_node is None:
+            return []
+
+        identifiers: list[str] = []
+        for child in args_node.children:
+            if child.type == "argument":
+                for sub in child.children:
+                    if sub.type == "variable_name":
+                        text = sub.text.decode().lstrip("$")
+                        identifiers.append(text)
+                    elif sub.type == "name":
+                        identifiers.append(sub.text.decode())
+        return identifiers
+
+    @staticmethod
+    def _extract_string_arguments(call_node: Node) -> list[str]:
+        """Extract string literal arguments that look like function names.
+
+        Used to resolve callback registrations like
+        ``register_shutdown_function('_my_handler')``.  Only returns
+        strings that are valid PHP identifiers (no backslashes, spaces, etc.).
+        """
+        args_node = call_node.child_by_field_name("arguments")
+        if args_node is None:
+            return []
+
+        names: list[str] = []
+        for child in args_node.children:
+            if child.type == "argument":
+                for sub in child.children:
+                    if sub.type in ("string", "encapsed_string"):
+                        for inner in sub.children:
+                            if inner.type == "string_content":
+                                text = inner.text.decode()
+                                # Only accept simple identifiers (no namespaces, spaces, etc.)
+                                if text.isidentifier():
+                                    names.append(text)
+        return names

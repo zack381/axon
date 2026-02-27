@@ -584,3 +584,330 @@ class TestCallBlocklist:
         process_calls(parse_data, g)
         calls_rels = g.get_relationships_by_type(RelType.CALLS)
         assert len(calls_rels) == 1
+
+
+# ---------------------------------------------------------------------------
+# resolve_call — parent::method() / super().method()
+# ---------------------------------------------------------------------------
+
+
+def _build_parent_child_graph() -> KnowledgeGraph:
+    """Build a graph with a parent class and a child class extending it.
+
+    Parent: src/base.py  BaseService  with method "connect" (lines 3-10)
+    Child:  src/child.py ChildService extends BaseService, method "init" (lines 3-15)
+    """
+    g = KnowledgeGraph()
+
+    # Files
+    _add_file_node(g, "src/base.py")
+    _add_file_node(g, "src/child.py")
+
+    # Parent class + method
+    _add_symbol_node(g, NodeLabel.CLASS, "src/base.py", "BaseService", 1, 20)
+    _add_symbol_node(
+        g, NodeLabel.METHOD, "src/base.py", "connect", 3, 10,
+        class_name="BaseService",
+    )
+
+    # Child class + method
+    _add_symbol_node(g, NodeLabel.CLASS, "src/child.py", "ChildService", 1, 20)
+    _add_symbol_node(
+        g, NodeLabel.METHOD, "src/child.py", "init", 3, 15,
+        class_name="ChildService",
+    )
+
+    # EXTENDS relationship: ChildService -> BaseService
+    child_id = generate_id(NodeLabel.CLASS, "src/child.py", "ChildService")
+    parent_id = generate_id(NodeLabel.CLASS, "src/base.py", "BaseService")
+    g.add_relationship(
+        GraphRelationship(
+            id=f"extends:{child_id}->{parent_id}",
+            type=RelType.EXTENDS,
+            source=child_id,
+            target=parent_id,
+        )
+    )
+
+    return g
+
+
+class TestResolveParentMethod:
+    """parent::method() and super().method() resolve to the parent class method."""
+
+    def test_parent_resolves_to_parent_method(self) -> None:
+        """parent::connect() in ChildService resolves to BaseService.connect."""
+        g = _build_parent_child_graph()
+        index = build_name_index(g, _CALLABLE_LABELS)
+        call = CallInfo(name="connect", line=8, receiver="parent")
+
+        target_id, confidence = resolve_call(call, "src/child.py", index, g)
+
+        expected_id = generate_id(
+            NodeLabel.METHOD, "src/base.py", "BaseService.connect"
+        )
+        assert target_id == expected_id
+        assert confidence == 0.9
+
+    def test_super_resolves_to_parent_method(self) -> None:
+        """super().connect() in ChildService resolves to BaseService.connect."""
+        g = _build_parent_child_graph()
+        index = build_name_index(g, _CALLABLE_LABELS)
+        call = CallInfo(name="connect", line=8, receiver="super")
+
+        target_id, confidence = resolve_call(call, "src/child.py", index, g)
+
+        expected_id = generate_id(
+            NodeLabel.METHOD, "src/base.py", "BaseService.connect"
+        )
+        assert target_id == expected_id
+        assert confidence == 0.9
+
+    def test_parent_no_parent_class_returns_none(self) -> None:
+        """parent::method() with no EXTENDS relationship falls through."""
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/orphan.py")
+        _add_symbol_node(g, NodeLabel.CLASS, "src/orphan.py", "Orphan", 1, 20)
+        _add_symbol_node(
+            g, NodeLabel.METHOD, "src/orphan.py", "do_thing", 3, 10,
+            class_name="Orphan",
+        )
+
+        index = build_name_index(g, _CALLABLE_LABELS)
+        call = CallInfo(name="do_thing", line=5, receiver="parent")
+
+        target_id, confidence = resolve_call(call, "src/orphan.py", index, g)
+
+        # No EXTENDS edge -> falls through to global fuzzy which finds same-file
+        # But do_thing IS in the same file, so it resolves as same-file match.
+        # The key point: it does NOT resolve via parent path (0.9).
+        # Since the method IS in the file, same-file match kicks in at 1.0.
+        assert target_id is not None
+        assert confidence != 0.9  # Not parent resolution
+
+    def test_parent_method_not_on_parent(self) -> None:
+        """parent::nonexistent() returns None when parent lacks the method."""
+        g = _build_parent_child_graph()
+        index = build_name_index(g, _CALLABLE_LABELS)
+        call = CallInfo(name="nonexistent", line=8, receiver="parent")
+
+        target_id, confidence = resolve_call(call, "src/child.py", index, g)
+
+        assert target_id is None
+        assert confidence == 0.0
+
+    def test_parent_resolution_via_process_calls(self) -> None:
+        """parent::connect() creates a CALLS edge through process_calls."""
+        g = _build_parent_child_graph()
+
+        parse_data = [
+            FileParseData(
+                file_path="src/child.py",
+                language="python",
+                parse_result=ParseResult(
+                    calls=[CallInfo(name="connect", line=8, receiver="parent")],
+                ),
+            ),
+        ]
+
+        process_calls(parse_data, g)
+
+        calls_rels = g.get_relationships_by_type(RelType.CALLS)
+        # Should have at least one CALLS edge for parent::connect()
+        parent_method_id = generate_id(
+            NodeLabel.METHOD, "src/base.py", "BaseService.connect"
+        )
+        targets = {r.target for r in calls_rels}
+        assert parent_method_id in targets
+
+        # Verify confidence is 0.9
+        for rel in calls_rels:
+            if rel.target == parent_method_id:
+                assert rel.properties["confidence"] == 0.9
+
+
+# ---------------------------------------------------------------------------
+# resolve_call — static::method() (PHP late static binding)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveStaticMethod:
+    """static::method() resolves same-class first, then parent class."""
+
+    def test_static_same_class(self) -> None:
+        """static::connect() resolves to same-class method at 1.0."""
+        g = _build_parent_child_graph()
+        # Add connect method to child class too
+        _add_symbol_node(
+            g, NodeLabel.METHOD, "src/child.py", "connect", 5, 12,
+            class_name="ChildService",
+        )
+
+        index = build_name_index(g, _CALLABLE_LABELS)
+        call = CallInfo(name="connect", line=8, receiver="static")
+
+        target_id, confidence = resolve_call(call, "src/child.py", index, g)
+
+        expected_id = generate_id(
+            NodeLabel.METHOD, "src/child.py", "ChildService.connect"
+        )
+        assert target_id == expected_id
+        assert confidence == 1.0
+
+    def test_static_falls_to_parent(self) -> None:
+        """static::connect() resolves to parent method at 0.9 when not on child."""
+        g = _build_parent_child_graph()
+        index = build_name_index(g, _CALLABLE_LABELS)
+        call = CallInfo(name="connect", line=8, receiver="static")
+
+        target_id, confidence = resolve_call(call, "src/child.py", index, g)
+
+        expected_id = generate_id(
+            NodeLabel.METHOD, "src/base.py", "BaseService.connect"
+        )
+        assert target_id == expected_id
+        assert confidence == 0.9
+
+    def test_static_nonexistent_returns_fuzzy(self) -> None:
+        """static::nonexistent() with no match falls through."""
+        g = _build_parent_child_graph()
+        index = build_name_index(g, _CALLABLE_LABELS)
+        call = CallInfo(name="nonexistent", line=8, receiver="static")
+
+        target_id, confidence = resolve_call(call, "src/child.py", index, g)
+
+        assert target_id is None
+        assert confidence == 0.0
+
+
+# ---------------------------------------------------------------------------
+# resolve_call — Receiver.method() (Class::method / $obj->method)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveReceiverMethod:
+    """ClassName::method() resolves via _resolve_receiver_method at 0.8."""
+
+    def test_class_static_call(self) -> None:
+        """User::find() resolves to User.find method."""
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/models.php")
+        _add_file_node(g, "src/app.php")
+
+        _add_symbol_node(g, NodeLabel.CLASS, "src/models.php", "User", 1, 30)
+        _add_symbol_node(
+            g, NodeLabel.METHOD, "src/models.php", "find", 5, 15,
+            class_name="User",
+        )
+        _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/app.php", "main", 1, 20,
+        )
+
+        parse_data = [
+            FileParseData(
+                file_path="src/app.php",
+                language="php",
+                parse_result=ParseResult(
+                    calls=[CallInfo(name="find", line=5, receiver="User")],
+                ),
+            ),
+        ]
+
+        process_calls(parse_data, g)
+
+        calls_rels = g.get_relationships_by_type(RelType.CALLS)
+        find_id = generate_id(NodeLabel.METHOD, "src/models.php", "User.find")
+        targets = {r.target for r in calls_rels}
+        assert find_id in targets
+
+        # Receiver method resolution uses confidence 0.8
+        for rel in calls_rels:
+            if rel.target == find_id:
+                assert rel.properties["confidence"] == 0.8
+
+    def test_receiver_method_same_file(self) -> None:
+        """Receiver method in same file still resolves at 0.8."""
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/service.php")
+
+        _add_symbol_node(g, NodeLabel.CLASS, "src/service.php", "Logger", 1, 15)
+        _add_symbol_node(
+            g, NodeLabel.METHOD, "src/service.php", "info", 3, 10,
+            class_name="Logger",
+        )
+        _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/service.php", "run", 20, 30,
+        )
+
+        parse_data = [
+            FileParseData(
+                file_path="src/service.php",
+                language="php",
+                parse_result=ParseResult(
+                    calls=[CallInfo(name="info", line=25, receiver="Logger")],
+                ),
+            ),
+        ]
+
+        process_calls(parse_data, g)
+
+        calls_rels = g.get_relationships_by_type(RelType.CALLS)
+        info_id = generate_id(NodeLabel.METHOD, "src/service.php", "Logger.info")
+        targets = {r.target for r in calls_rels}
+        assert info_id in targets
+
+    def test_receiver_class_also_linked(self) -> None:
+        """ClassName in ClassName::method() also gets a CALLS edge to the class."""
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/models.php")
+        _add_file_node(g, "src/app.php")
+
+        _add_symbol_node(g, NodeLabel.CLASS, "src/models.php", "User", 1, 30)
+        _add_symbol_node(
+            g, NodeLabel.METHOD, "src/models.php", "find", 5, 15,
+            class_name="User",
+        )
+        _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/app.php", "main", 1, 20,
+        )
+
+        parse_data = [
+            FileParseData(
+                file_path="src/app.php",
+                language="php",
+                parse_result=ParseResult(
+                    calls=[CallInfo(name="find", line=5, receiver="User")],
+                ),
+            ),
+        ]
+
+        process_calls(parse_data, g)
+
+        calls_rels = g.get_relationships_by_type(RelType.CALLS)
+        user_class_id = generate_id(NodeLabel.CLASS, "src/models.php", "User")
+        targets = {r.target for r in calls_rels}
+        # The class itself should also get a CALLS edge
+        assert user_class_id in targets
+
+    def test_special_receivers_not_resolved_as_class(self) -> None:
+        """parent/super/static receivers don't try class name resolution."""
+        g = _build_parent_child_graph()
+
+        parse_data = [
+            FileParseData(
+                file_path="src/child.py",
+                language="python",
+                parse_result=ParseResult(
+                    calls=[CallInfo(name="connect", line=8, receiver="parent")],
+                ),
+            ),
+        ]
+
+        process_calls(parse_data, g)
+
+        calls_rels = g.get_relationships_by_type(RelType.CALLS)
+        # Should NOT have a CALLS edge to a node named "parent"
+        for rel in calls_rels:
+            node = g.get_node(rel.target)
+            if node is not None:
+                assert node.name != "parent"

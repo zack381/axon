@@ -16,6 +16,7 @@ import logging
 
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import (
+    GraphNode,
     GraphRelationship,
     NodeLabel,
     RelType,
@@ -74,6 +75,29 @@ _CALL_BLOCKLIST: frozenset[str] = frozenset({
     "useState", "useEffect", "useRef", "useCallback", "useMemo",
     "useContext", "useReducer", "useLayoutEffect", "useImperativeHandle",
     "useDebugValue", "useId", "useTransition", "useDeferredValue",
+    # PHP builtins
+    "echo", "print_r", "var_dump", "isset", "unset", "empty", "die", "exit",
+    "array_map", "array_filter", "array_merge", "array_push", "array_pop",
+    "array_shift", "array_unshift", "array_keys", "array_values",
+    "array_unique", "array_reverse", "array_slice", "array_splice",
+    "array_search", "array_key_exists", "in_array", "count", "sizeof",
+    "strlen", "strpos", "substr", "strtolower", "strtoupper", "trim",
+    "ltrim", "rtrim", "explode", "implode", "sprintf", "printf",
+    "str_replace", "preg_match", "preg_replace", "preg_match_all",
+    "is_null", "is_array", "is_string", "is_int", "is_numeric", "is_bool",
+    "intval", "floatval", "strval", "boolval",
+    "json_encode", "json_decode", "date", "time", "strtotime",
+    "file_get_contents", "file_put_contents", "fopen", "fclose", "fread",
+    "fwrite", "file_exists", "is_file", "is_dir", "mkdir", "unlink",
+    "header", "session_start", "session_destroy",
+    "defined", "define", "constant", "class_exists", "method_exists",
+    "function_exists", "property_exists", "get_class", "get_parent_class",
+    "compact", "extract", "array_combine", "range", "usort", "uksort",
+    "array_walk", "array_column", "array_fill", "array_chunk",
+    "htmlspecialchars", "htmlentities", "urlencode", "urldecode",
+    "base64_encode", "base64_decode", "md5", "sha1", "hash",
+    "number_format", "round", "ceil", "floor", "abs", "max", "min",
+    "rand", "mt_rand", "array_rand",
 })
 
 def resolve_call(
@@ -118,7 +142,21 @@ def resolve_call(
         if result is not None:
             return result, 1.0
 
-    # Without type info the receiver doesn't help — fall through to name-based resolution.
+    if receiver in ("parent", "super"):
+        result = _resolve_parent_method(name, file_path, call_index, graph)
+        if result is not None:
+            return result, 0.9
+
+    if receiver == "static":
+        # PHP late static binding — try same-class first (like self::),
+        # then walk EXTENDS chain (like parent::).
+        result = _resolve_self_method(name, file_path, call_index, graph)
+        if result is not None:
+            return result, 1.0
+        result = _resolve_parent_method(name, file_path, call_index, graph)
+        if result is not None:
+            return result, 0.9
+
     candidate_ids = call_index.get(name, [])
     if not candidate_ids:
         return None, 0.0
@@ -134,8 +172,38 @@ def resolve_call(
     if imported_target is not None:
         return imported_target, 1.0
 
-    # 3. Global fuzzy match -- prefer shortest file path.
-    return _pick_closest(candidate_ids, graph), 0.5
+    # 3. Receiver-qualified match — if we know the class name, prefer matching
+    #    METHOD nodes with that class_name over a bare global fuzzy match.
+    if receiver and receiver not in ("self", "this", "parent", "super", "static"):
+        for nid in candidate_ids:
+            node = graph.get_node(nid)
+            if (
+                node is not None
+                and node.label == NodeLabel.METHOD
+                and node.class_name == receiver
+            ):
+                return nid, 0.8
+
+    # 4. Global fuzzy match -- prefer path proximity to caller, then shortest path.
+    return _pick_closest(candidate_ids, file_path, graph), 0.5
+
+def _resolve_same_file(
+    name: str,
+    file_path: str,
+    call_index: dict[str, list[str]],
+    graph: KnowledgeGraph,
+) -> str | None:
+    """Find a symbol with *name* defined in the same file.
+
+    Used to override the call blocklist: if a user defines a function
+    named ``close`` or ``get`` in the same file and calls it, that is
+    clearly intentional and should produce a CALLS edge.
+    """
+    for nid in call_index.get(name, []):
+        node = graph.get_node(nid)
+        if node is not None and node.file_path == file_path:
+            return nid
+    return None
 
 def _resolve_self_method(
     method_name: str,
@@ -157,6 +225,50 @@ def _resolve_self_method(
         ):
             return nid
     return None
+
+def _resolve_parent_method(
+    method_name: str,
+    file_path: str,
+    call_index: dict[str, list[str]],
+    graph: KnowledgeGraph,
+) -> str | None:
+    """Resolve ``parent::method()`` or ``super().method()`` to the parent class method.
+
+    Finds the calling class in *file_path*, walks EXTENDS edges to find parent
+    classes, then looks for a method with *method_name* on each parent.
+    """
+    # Find all classes in the same file to identify the calling class.
+    caller_class_names: list[str] = []
+    for node in graph.get_nodes_by_label(NodeLabel.CLASS):
+        if node.file_path == file_path:
+            caller_class_names.append(node.name)
+
+    # Also check methods in this file to find class names.
+    for node in graph.get_nodes_by_label(NodeLabel.METHOD):
+        if node.file_path == file_path and node.class_name:
+            if node.class_name not in caller_class_names:
+                caller_class_names.append(node.class_name)
+
+    # For each class, look up EXTENDS relationships and find parent methods.
+    for class_name in caller_class_names:
+        class_id = generate_id(NodeLabel.CLASS, file_path, class_name)
+        extends_rels = graph.get_outgoing(class_id, RelType.EXTENDS)
+        for rel in extends_rels:
+            parent_node = graph.get_node(rel.target)
+            if parent_node is None:
+                continue
+            # Look for the method on the parent class.
+            for nid in call_index.get(method_name, []):
+                node = graph.get_node(nid)
+                if (
+                    node is not None
+                    and node.label == NodeLabel.METHOD
+                    and node.class_name == parent_node.name
+                ):
+                    return nid
+
+    return None
+
 
 def _resolve_via_imports(
     name: str,
@@ -198,18 +310,45 @@ def _resolve_via_imports(
 
     return None
 
-def _pick_closest(candidate_ids: list[str], graph: KnowledgeGraph) -> str | None:
-    """Pick the candidate with the shortest file path (proximity heuristic).
+def _common_prefix_len(a: str, b: str) -> int:
+    """Return the length of the longest common directory prefix."""
+    parts_a = a.split("/")
+    parts_b = b.split("/")
+    common = 0
+    for pa, pb in zip(parts_a, parts_b):
+        if pa == pb:
+            common += 1
+        else:
+            break
+    return common
+
+
+def _pick_closest(
+    candidate_ids: list[str],
+    caller_file_path: str,
+    graph: KnowledgeGraph,
+) -> str | None:
+    """Pick the candidate closest to *caller_file_path*.
+
+    Proximity is measured by the longest common directory prefix with the
+    caller's file path.  Ties are broken by shortest absolute path length
+    (the original heuristic).
 
     Returns ``None`` if no candidates can be resolved to actual nodes.
     """
     best_id: str | None = None
+    best_prefix = -1
     best_path_len = float("inf")
 
     for nid in candidate_ids:
         node = graph.get_node(nid)
-        if node is not None and len(node.file_path) < best_path_len:
-            best_path_len = len(node.file_path)
+        if node is None:
+            continue
+        prefix = _common_prefix_len(node.file_path, caller_file_path)
+        path_len = len(node.file_path)
+        if prefix > best_prefix or (prefix == best_prefix and path_len < best_path_len):
+            best_prefix = prefix
+            best_path_len = path_len
             best_id = nid
 
     return best_id
@@ -271,6 +410,61 @@ def _resolve_receiver_method(
         _add_calls_edge(source_id, target, 0.8, graph, seen)
 
 
+def _build_global_return_types(parse_data: list[FileParseData]) -> dict[str, list[str]]:
+    """Build a global mapping from function names to their return type names.
+
+    Scans all files' symbols and type_refs to find functions with return type
+    annotations.  Used to resolve cross-file factory patterns like
+    ``$client = getMessagingClient()`` where the factory is in another file.
+    """
+    # First pass: collect function name -> (start_line, end_line, file_path).
+    func_ranges: dict[str, list[tuple[int, int, str]]] = {}
+    for fpd in parse_data:
+        for sym in fpd.parse_result.symbols:
+            if sym.kind == "function":
+                func_ranges.setdefault(sym.name, []).append(
+                    (sym.start_line, sym.end_line, fpd.file_path)
+                )
+
+    # Second pass: match return type_refs to functions.
+    result: dict[str, list[str]] = {}
+    for fpd in parse_data:
+        for tref in fpd.parse_result.type_refs:
+            if tref.kind != "return":
+                continue
+            for name, ranges in func_ranges.items():
+                for start, end, fpath in ranges:
+                    if fpath == fpd.file_path and start <= tref.line <= end:
+                        result.setdefault(name, []).append(tref.name)
+
+    return result
+
+
+def _enrich_variable_types(
+    parse_data: list[FileParseData],
+    global_return_types: dict[str, list[str]],
+) -> None:
+    """Resolve cross-file ``__call__`` sentinels in per-file variable_types.
+
+    The PHP parser stores ``["__call__functionName"]`` for assignments like
+    ``$client = getMessagingClient()`` when the function is defined in a
+    different file.  This function resolves those sentinels using the global
+    function-return-type mapping.
+    """
+    for fpd in parse_data:
+        vt = fpd.parse_result.variable_types
+        for var_name, types in list(vt.items()):
+            if len(types) == 1 and types[0].startswith("__call__"):
+                func_name = types[0][8:]  # strip "__call__" prefix
+                resolved = global_return_types.get(func_name)
+                if resolved:
+                    vt[var_name] = resolved
+                else:
+                    # Cannot resolve — remove the sentinel so it doesn't
+                    # interfere with receiver matching.
+                    del vt[var_name]
+
+
 def process_calls(
     parse_data: list[FileParseData],
     graph: KnowledgeGraph,
@@ -294,37 +488,61 @@ def process_calls(
         parse_data: File parse results from the parser phase.
         graph: The knowledge graph to populate with CALLS relationships.
     """
+    # Enrich variable type mappings with cross-file return type information.
+    global_return_types = _build_global_return_types(parse_data)
+    _enrich_variable_types(parse_data, global_return_types)
+
     call_index = build_name_index(graph, _CALLABLE_LABELS)
     file_sym_index = build_file_symbol_index(graph, _CALLABLE_LABELS)
     seen: set[str] = set()
 
     for fpd in parse_data:
         for call in fpd.parse_result.calls:
-            if call.name in _CALL_BLOCKLIST and call.receiver not in ("self", "this"):
-                continue
+            is_blocklisted = (
+                call.name in _CALL_BLOCKLIST
+                and call.receiver not in ("self", "this")
+            )
 
             source_id = find_containing_symbol(
                 call.line, fpd.file_path, file_sym_index
             )
             if source_id is None:
-                logger.debug(
-                    "No containing symbol for call %s at line %d in %s",
-                    call.name,
-                    call.line,
-                    fpd.file_path,
-                )
-                continue
+                # Top-level calls (e.g. PHP switch-dispatch, HTML inline
+                # scripts, JS module-level code) have no containing symbol.
+                # Fall back to the FILE node so the target still gets an
+                # incoming CALLS edge and avoids false dead-code flags.
+                source_id = generate_id(NodeLabel.FILE, fpd.file_path)
+                if graph.get_node(source_id) is None:
+                    continue
 
-            target_id, confidence = resolve_call(
-                call, fpd.file_path, call_index, graph
-            )
-            if target_id is not None:
-                _add_calls_edge(source_id, target_id, confidence, graph, seen)
+            if not is_blocklisted:
+                target_id, confidence = resolve_call(
+                    call, fpd.file_path, call_index, graph
+                )
+                if target_id is not None:
+                    _add_calls_edge(source_id, target_id, confidence, graph, seen)
+            else:
+                # Blocklisted names still get same-file resolution — if a
+                # user defines a function called "close" or "get" and calls
+                # it in the same file, that's clearly intentional.
+                target_id = _resolve_same_file(
+                    call.name, fpd.file_path, call_index, graph
+                )
+                if target_id is not None:
+                    _add_calls_edge(source_id, target_id, 1.0, graph, seen)
 
             # Callback arguments: bare identifiers passed as arguments
-            # (e.g. map(transform, items), Depends(get_db)).
+            # (e.g. map(transform, items), Depends(get_db),
+            # setTimeout(handler, 1000)).  Always processed even when the
+            # callee is blocklisted — the callback itself may be user code.
             for arg_name in call.arguments:
                 if arg_name in _CALL_BLOCKLIST:
+                    # Still allow same-file resolution for blocklisted callbacks.
+                    arg_target = _resolve_same_file(
+                        arg_name, fpd.file_path, call_index, graph
+                    )
+                    if arg_target is not None:
+                        _add_calls_edge(source_id, arg_target, 0.8, graph, seen)
                     continue
                 arg_call = CallInfo(name=arg_name, line=call.line)
                 arg_id, arg_conf = resolve_call(
@@ -334,19 +552,30 @@ def process_calls(
                     _add_calls_edge(source_id, arg_id, arg_conf * 0.8, graph, seen)
 
             # Receiver: link to the class and resolve the method on it.
-            receiver = call.receiver
-            if receiver and receiver not in ("self", "this"):
-                receiver_call = CallInfo(name=receiver, line=call.line)
-                recv_id, recv_conf = resolve_call(
-                    receiver_call, fpd.file_path, call_index, graph
-                )
-                if recv_id is not None:
-                    _add_calls_edge(source_id, recv_id, recv_conf, graph, seen)
+            if not is_blocklisted:
+                receiver = call.receiver
+                if receiver and receiver not in ("self", "this", "parent", "super", "static"):
+                    receiver_call = CallInfo(name=receiver, line=call.line)
+                    recv_id, recv_conf = resolve_call(
+                        receiver_call, fpd.file_path, call_index, graph
+                    )
+                    if recv_id is not None:
+                        _add_calls_edge(source_id, recv_id, recv_conf, graph, seen)
 
-                _resolve_receiver_method(
-                    receiver, call.name, source_id, fpd.file_path,
-                    call_index, graph, seen,
-                )
+                    # Try inferred variable types first (e.g. $client = getFactory()
+                    # where getFactory returns LinqClient|BlueBubblesClient).
+                    inferred_types = fpd.parse_result.variable_types.get(receiver)
+                    if inferred_types:
+                        for class_name in inferred_types:
+                            _resolve_receiver_method(
+                                class_name, call.name, source_id, fpd.file_path,
+                                call_index, graph, seen,
+                            )
+                    else:
+                        _resolve_receiver_method(
+                            receiver, call.name, source_id, fpd.file_path,
+                            call_index, graph, seen,
+                        )
 
         # Decorators are implicit calls — @cost_decorator on a function is
         # equivalent to calling cost_decorator(func).  Create CALLS edges

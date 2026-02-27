@@ -8,6 +8,8 @@ source files.
 
 from __future__ import annotations
 
+import re
+
 import tree_sitter_javascript as tsjavascript
 import tree_sitter_typescript as tstypescript
 from tree_sitter import Language, Node, Parser
@@ -102,6 +104,8 @@ class TypeScriptParser(LanguageParser):
             self._extract_interface(node, source, result)
         elif ntype == "type_alias_declaration":
             self._extract_type_alias(node, source, result)
+        elif ntype == "enum_declaration":
+            self._extract_enum(node, source, result)
         elif ntype == "import_statement":
             self._extract_import(node, source, result)
         elif ntype == "call_expression":
@@ -112,6 +116,16 @@ class TypeScriptParser(LanguageParser):
             self._maybe_extract_module_exports(node, source, result)
         elif ntype == "method_definition":
             self._extract_method(node, source, result)
+        elif ntype in ("jsx_opening_element", "jsx_self_closing_element"):
+            self._extract_jsx_callbacks(node, result)
+        elif ntype == "template_string":
+            self._extract_template_onclick_refs(node, result)
+        elif ntype == "shorthand_property_identifier":
+            # { funcA, funcB } — shorthand object property is a reference
+            # to a same-scope symbol (function, variable, etc.).
+            result.calls.append(
+                CallInfo(name=node.text.decode(), line=node.start_point[0] + 1)
+            )
 
         for child in node.children:
             self._walk(child, source, result, visited)
@@ -151,7 +165,13 @@ class TypeScriptParser(LanguageParser):
     def _maybe_extract_module_exports(
         self, node: Node, source: str, result: ParseResult
     ) -> None:
-        """Handle ``module.exports = X`` and ``module.exports = { A, B }``."""
+        """Handle ``module.exports``, ``exports``, and ``window.X`` assignments.
+
+        Detects three patterns that expose symbols to other files:
+        - ``module.exports = X`` / ``module.exports = { A, B }``
+        - ``exports.X = ...``
+        - ``window.MyNamespace = { A, B, C }`` (browser-global revealing pattern)
+        """
         for child in node.children:
             if child.type != "assignment_expression":
                 continue
@@ -161,13 +181,19 @@ class TypeScriptParser(LanguageParser):
                 continue
 
             left_text = left.text.decode()
-            if left_text not in ("module.exports", "exports"):
+
+            is_module_export = left_text in ("module.exports", "exports")
+            is_window_export = (
+                left.type == "member_expression"
+                and left_text.startswith("window.")
+            )
+
+            if not is_module_export and not is_window_export:
                 continue
 
             if right.type == "identifier":
                 result.exports.append(right.text.decode())
             elif right.type == "object":
-                # module.exports = { Foo, Bar, baz: something }
                 for prop in right.children:
                     if prop.type == "shorthand_property_identifier":
                         result.exports.append(prop.text.decode())
@@ -399,6 +425,27 @@ class TypeScriptParser(LanguageParser):
             )
         )
 
+    def _extract_enum(self, node: Node, source: str, result: ParseResult) -> None:
+        """Extract a TypeScript ``enum`` declaration as an enum symbol."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+
+        name = name_node.text.decode()
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        content = node.text.decode()
+
+        result.symbols.append(
+            SymbolInfo(
+                name=name,
+                kind="enum",
+                start_line=start_line,
+                end_line=end_line,
+                content=content,
+            )
+        )
+
     def _extract_import(self, node: Node, source: str, result: ParseResult) -> None:
         """Handle ES module import statements."""
         module_str = ""
@@ -466,14 +513,18 @@ class TypeScriptParser(LanguageParser):
             prop_node = func_node.child_by_field_name("property")
             if prop_node is not None:
                 receiver = obj_node.text.decode() if obj_node else ""
+                prop_text = prop_node.text.decode()
                 result.calls.append(
                     CallInfo(
-                        name=prop_node.text.decode(),
+                        name=prop_text,
                         line=line,
                         receiver=receiver,
                         arguments=arguments,
                     )
                 )
+                # React.createElement(Component, {onClick: handler})
+                if prop_text == "createElement":
+                    self._extract_create_element_refs(node, result)
         elif func_node.type == "identifier":
             name = func_node.text.decode()
             # Skip require() since it's handled as an import.
@@ -512,6 +563,150 @@ class TypeScriptParser(LanguageParser):
                         arguments=arguments,
                     )
                 )
+
+    def _extract_jsx_callbacks(self, node: Node, result: ParseResult) -> None:
+        """Extract component references and callback props from JSX elements.
+
+        1. If the tag name starts with an uppercase letter it is a React
+           component — emit a CallInfo so the component gets a CALLS edge.
+        2. For any ``on`` + uppercase attribute (e.g. ``onClick``,
+           ``onSave``), extract bare identifiers and member expressions
+           as callback references.
+        """
+        line = node.start_point[0] + 1
+
+        # --- Component tag name ---
+        for child in node.children:
+            if child.type == "identifier":
+                tag_name = child.text.decode()
+                if tag_name and tag_name[0].isupper():
+                    result.calls.append(CallInfo(name=tag_name, line=line))
+                break
+            elif child.type == "member_expression":
+                prop = child.child_by_field_name("property")
+                obj = child.child_by_field_name("object")
+                if prop is not None:
+                    result.calls.append(
+                        CallInfo(
+                            name=prop.text.decode(),
+                            line=line,
+                            receiver=obj.text.decode() if obj else "",
+                        )
+                    )
+                break
+
+        # --- Prop function references ---
+        # Any JSX attribute whose value is a bare identifier or member
+        # expression is a potential function reference (not just on* props).
+        # This captures patterns like ``viewCampaign={viewCampaign}`` and
+        # ``closeCampaignDetail={closeCampaignDetail}``.
+        for child in node.children:
+            if child.type != "jsx_attribute":
+                continue
+            attr_value_node = None
+            for sub in child.children:
+                if sub.type == "jsx_expression":
+                    attr_value_node = sub
+
+            if attr_value_node is None:
+                continue
+
+            for expr_child in attr_value_node.children:
+                if expr_child.type == "identifier":
+                    result.calls.append(
+                        CallInfo(
+                            name=expr_child.text.decode(),
+                            line=child.start_point[0] + 1,
+                        )
+                    )
+                elif expr_child.type == "member_expression":
+                    prop = expr_child.child_by_field_name("property")
+                    obj = expr_child.child_by_field_name("object")
+                    if prop is not None:
+                        receiver = obj.text.decode() if obj else ""
+                        result.calls.append(
+                            CallInfo(
+                                name=prop.text.decode(),
+                                line=child.start_point[0] + 1,
+                                receiver=receiver,
+                            )
+                        )
+
+    def _extract_create_element_refs(self, node: Node, result: ParseResult) -> None:
+        """Extract component and callback refs from ``React.createElement`` calls.
+
+        ``React.createElement(Component, {onClick: handler})`` — the first
+        argument is a component reference (if uppercase identifier) and the
+        second argument may contain ``on*`` callback properties.
+        """
+        args_node = node.child_by_field_name("arguments")
+        if args_node is None:
+            return
+
+        line = node.start_point[0] + 1
+        arg_children = [
+            c for c in args_node.children if c.type not in (",", "(", ")")
+        ]
+
+        # First argument: component name (uppercase identifier = React component)
+        if arg_children:
+            first_arg = arg_children[0]
+            if first_arg.type == "identifier":
+                name = first_arg.text.decode()
+                if name and name[0].isupper():
+                    result.calls.append(CallInfo(name=name, line=line))
+
+        # Second argument: props object — extract identifier values as potential
+        # function references (same logic as expanded JSX prop handling).
+        if len(arg_children) >= 2:
+            props_arg = arg_children[1]
+            if props_arg.type == "object":
+                for prop in props_arg.children:
+                    if prop.type == "shorthand_property_identifier":
+                        result.calls.append(
+                            CallInfo(name=prop.text.decode(), line=line)
+                        )
+                    elif prop.type == "pair":
+                        value = prop.child_by_field_name("value")
+                        if value is not None and value.type == "identifier":
+                            result.calls.append(
+                                CallInfo(name=value.text.decode(), line=line)
+                            )
+
+    # Matches function references inside template literal strings:
+    # 1. onclick="funcName(..." — inline event handler in generated HTML
+    # 2. `funcName(${arg})` — bare function call string (used for dynamic onclick)
+    _TEMPLATE_EVENT_RE = re.compile(
+        r"""on\w+\s*=\s*["']([A-Za-z_$][A-Za-z0-9_$]*)\s*\(""",
+    )
+    _TEMPLATE_BARE_CALL_RE = re.compile(
+        r"""^([A-Za-z_$][A-Za-z0-9_$]*)\s*\(""",
+    )
+
+    def _extract_template_onclick_refs(self, node: Node, result: ParseResult) -> None:
+        """Extract function references from inline event handlers in template strings.
+
+        Scans template literal content for patterns like ``onclick="funcName(..."``
+        and emits synthetic CallInfo entries so the referenced function gets a
+        CALLS edge instead of being flagged as dead code.
+        """
+        line = node.start_point[0] + 1
+        for child in node.children:
+            if child.type == "string_fragment" or child.type == "template_content":
+                text = child.text.decode()
+            elif child.type == "template_substitution":
+                continue
+            else:
+                continue
+            for m in self._TEMPLATE_EVENT_RE.finditer(text):
+                func_name = m.group(1)
+                result.calls.append(CallInfo(name=func_name, line=line))
+            # Bare function call at start of template fragment
+            # (e.g. `openCampaignStatsById(${c.id})`)
+            m = self._TEMPLATE_BARE_CALL_RE.match(text.strip())
+            if m:
+                func_name = m.group(1)
+                result.calls.append(CallInfo(name=func_name, line=line))
 
     @staticmethod
     def _extract_identifier_arguments(call_node: Node) -> list[str]:

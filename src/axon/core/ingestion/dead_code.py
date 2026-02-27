@@ -21,7 +21,100 @@ _SYMBOL_LABELS: tuple[NodeLabel, ...] = (
     NodeLabel.CLASS,
 )
 
-_CONSTRUCTOR_NAMES: frozenset[str] = frozenset({"__init__", "__new__"})
+_CONSTRUCTOR_NAMES: frozenset[str] = frozenset({"__init__", "__new__", "__construct"})
+
+# Test framework lifecycle methods invoked implicitly by the runner.
+_LIFECYCLE_METHODS: frozenset[str] = frozenset({
+    # PHPUnit / JUnit
+    "setUp", "tearDown", "setUpBeforeClass", "tearDownAfterClass",
+    # Python unittest
+    "setUpClass", "tearDownClass", "setUpModule", "tearDownModule",
+})
+
+# PHP magic methods that are invoked implicitly by the runtime.
+_PHP_MAGIC_METHODS: frozenset[str] = frozenset({
+    "__construct", "__destruct", "__call", "__callStatic", "__get",
+    "__set", "__isset", "__unset", "__sleep", "__wakeup", "__serialize",
+    "__unserialize", "__toString", "__invoke", "__set_state", "__clone",
+    "__debugInfo",
+})
+
+# Interface/protocol methods invoked implicitly by the runtime or framework.
+# These methods are never called directly in user code but are triggered
+# by language constructs (e.g. json_encode calls jsonSerialize, foreach
+# calls getIterator/current/key/next/rewind/valid).
+_IMPLICIT_INTERFACE_METHODS: frozenset[str] = frozenset({
+    # PHP JsonSerializable
+    "jsonSerialize",
+    # PHP Countable
+    "count",
+    # PHP ArrayAccess
+    "offsetGet", "offsetSet", "offsetExists", "offsetUnset",
+    # PHP IteratorAggregate / Iterator
+    "getIterator", "current", "key", "next", "rewind", "valid",
+    # PHP Serializable
+    "serialize", "unserialize",
+    # PHP Stringable (invoked by string casts)
+    "__toString",
+    # Laravel / common conventions
+    "toArray", "toJson",
+    # JavaScript/TypeScript (called by JSON.stringify)
+    "toJSON",
+    # Python conventions (called by serialization frameworks)
+    "to_dict", "as_dict", "to_json", "from_dict", "from_json",
+    # Pydantic v1/v2 (called by framework internals)
+    "dict", "json", "model_dump", "model_dump_json",
+    "model_validate", "model_validate_json",
+})
+
+# Framework directory patterns where methods are invoked implicitly by the
+# framework (e.g. Laravel migrations, seeders, console commands, event
+# listeners, service providers, middleware, jobs).  Each tuple is
+# (directory_substring, frozenset_of_method_names).
+_FRAMEWORK_DIR_METHODS: tuple[tuple[str, frozenset[str]], ...] = (
+    # Laravel / generic migrations
+    ("/migrations/", frozenset({"up", "down"})),
+    ("/database/migrations/", frozenset({"up", "down"})),
+    # Seeders
+    ("/seeders/", frozenset({"run"})),
+    ("/seeds/", frozenset({"run"})),
+    # Console commands
+    ("/Commands/", frozenset({"handle"})),
+    ("/commands/", frozenset({"handle"})),
+    # Event listeners
+    ("/Listeners/", frozenset({"handle"})),
+    ("/listeners/", frozenset({"handle"})),
+    # Service providers
+    ("/Providers/", frozenset({"register", "boot"})),
+    # Middleware
+    ("/Middleware/", frozenset({"handle"})),
+    ("/middleware/", frozenset({"handle"})),
+    # Jobs / queue workers
+    ("/Jobs/", frozenset({"handle"})),
+    ("/jobs/", frozenset({"handle"})),
+)
+
+
+def _is_framework_method(name: str, file_path: str) -> bool:
+    """Return ``True`` if *name* is a framework-invoked method in a framework directory.
+
+    Methods like ``up()``/``down()`` in migration files, ``handle()`` in
+    command/listener files, ``register()``/``boot()`` in service providers,
+    etc. are invoked by the framework, never directly by user code.
+    """
+    for dir_pattern, method_names in _FRAMEWORK_DIR_METHODS:
+        if dir_pattern in file_path and name in method_names:
+            return True
+    return False
+
+
+def _is_test_method(name: str) -> bool:
+    """Return ``True`` if *name* follows PHPUnit / JUnit test convention.
+
+    Matches camelCase names starting with ``test`` where the next character
+    is uppercase, e.g. ``testSanitizeEscapesHtml``, ``testEncryptRoundTrip``.
+    """
+    return len(name) > 4 and name.startswith("test") and name[4].isupper()
 
 def _is_test_class(name: str) -> bool:
     """Return ``True`` if *name* follows pytest class convention (``Test*``).
@@ -34,9 +127,48 @@ def _is_test_class(name: str) -> bool:
 def _is_test_file(file_path: str) -> bool:
     """Return ``True`` if the file is in a test directory or is a test file.
 
-    Matches paths containing ``/tests/`` or files named ``test_*.py``.
+    Matches Python conventions (``/tests/``, ``test_*.py``, ``conftest.py``),
+    JavaScript/TypeScript conventions (``__tests__/``, ``*.test.*``,
+    ``*.spec.*``), and PHP conventions (``tests/`` or ``Tests/``,
+    ``*Test.php``).
     """
-    return "/tests/" in file_path or "/test_" in file_path or file_path.endswith("conftest.py")
+    return (
+        "/tests/" in file_path
+        or "/Tests/" in file_path
+        or file_path.startswith("tests/")
+        or file_path.startswith("Tests/")
+        or "/test/" in file_path
+        or "/__tests__/" in file_path
+        or "/test_" in file_path
+        or ".test." in file_path
+        or ".spec." in file_path
+        or file_path.endswith("conftest.py")
+        or file_path.endswith("Test.php")
+    )
+
+def _is_example_file(file_path: str) -> bool:
+    """Return ``True`` if the file is an example/template/sample file.
+
+    Files like ``config.example.php`` or ``settings.sample.py`` are
+    documentation templates, not production code.  Symbols in them should
+    never be flagged as dead code.
+    """
+    return (
+        ".example." in file_path
+        or ".sample." in file_path
+        or ".template." in file_path
+        or "/examples/" in file_path
+        or "/example/" in file_path
+    )
+
+def _is_html_file(file_path: str) -> bool:
+    """Return ``True`` if the file is an HTML file.
+
+    Functions in HTML inline ``<script>`` blocks are almost always page-local
+    UI handlers bound via template-literal ``onclick`` strings, ``addEventListener``
+    callbacks, or array references that cannot be statically extracted.
+    """
+    return file_path.endswith((".html", ".htm"))
 
 def _is_dunder(name: str) -> bool:
     """Return ``True`` if *name* is a dunder (double-underscore) method.
@@ -57,6 +189,21 @@ def _is_type_referenced(graph: KnowledgeGraph, node_id: str, label: NodeLabel) -
     if label != NodeLabel.CLASS:
         return False
     return graph.has_incoming(node_id, RelType.USES_TYPE)
+
+
+def _is_subclassed(graph: KnowledgeGraph, node_id: str, label: NodeLabel) -> bool:
+    """Return ``True`` if *node_id* is a class or interface with subclasses.
+
+    A class that has incoming EXTENDS or IMPLEMENTS edges is being
+    subclassed/implemented — it is not dead even if never instantiated
+    directly (e.g. abstract base classes, interfaces).
+    """
+    if label != NodeLabel.CLASS:
+        return False
+    return (
+        graph.has_incoming(node_id, RelType.EXTENDS)
+        or graph.has_incoming(node_id, RelType.IMPLEMENTS)
+    )
 
 _NON_FRAMEWORK_DECORATORS: frozenset[str] = frozenset({
     "functools.wraps",
@@ -128,16 +275,25 @@ def _is_exempt(
     - It lives in a test file (fixtures, helpers are not dead code).
     - It is a dunder method (``__str__``, ``__repr__``, etc.).
     - It is a public symbol in a Python ``__init__.py`` file.
+    - It is a test lifecycle method (``setUp``, ``tearDown``, etc.).
+    - It lives in an HTML file (inline script functions are page-local).
+    - It lives in an example/template file (documentation, not production).
     """
     return (
         is_entry_point
         or is_exported
         or name in _CONSTRUCTOR_NAMES
+        or name in _PHP_MAGIC_METHODS
+        or name in _LIFECYCLE_METHODS
         or name.startswith("test_")
+        or _is_test_method(name)
         or _is_test_class(name)
         or _is_test_file(file_path)
         or _is_dunder(name)
         or _is_python_public_api(name, file_path)
+        or _is_html_file(file_path)
+        or _is_example_file(file_path)
+        or _is_framework_method(name, file_path)
     )
 
 def _clear_override_false_positives(graph: KnowledgeGraph) -> int:
@@ -155,13 +311,14 @@ def _clear_override_false_positives(graph: KnowledgeGraph) -> int:
         if not method.is_dead and method.class_name:
             alive_methods_by_class.setdefault(method.class_name, set()).add(method.name)
 
-    # Build child -> parent class mapping from EXTENDS relationships.
+    # Build child -> parent class mapping from EXTENDS and IMPLEMENTS relationships.
     child_to_parents: dict[str, list[str]] = {}
-    for rel in graph.get_relationships_by_type(RelType.EXTENDS):
-        child_node = graph.get_node(rel.source)
-        parent_node = graph.get_node(rel.target)
-        if child_node and parent_node:
-            child_to_parents.setdefault(child_node.name, []).append(parent_node.name)
+    for rel_type in (RelType.EXTENDS, RelType.IMPLEMENTS):
+        for rel in graph.get_relationships_by_type(rel_type):
+            child_node = graph.get_node(rel.source)
+            parent_node = graph.get_node(rel.target)
+            if child_node and parent_node:
+                child_to_parents.setdefault(child_node.name, []).append(parent_node.name)
 
     cleared = 0
     for method in graph.get_nodes_by_label(NodeLabel.METHOD):
@@ -317,6 +474,8 @@ def process_dead_code(graph: KnowledgeGraph) -> int:
                 continue
             if _is_type_referenced(graph, node.id, label):
                 continue
+            if _is_subclassed(graph, node.id, label):
+                continue
             if _has_framework_decorator(node):
                 continue
             if _has_property_decorator(node):
@@ -324,6 +483,8 @@ def process_dead_code(graph: KnowledgeGraph) -> int:
             if _has_typing_stub_decorator(node):
                 continue
             if _is_enum_class(node, label):
+                continue
+            if label == NodeLabel.METHOD and node.name in _IMPLICIT_INTERFACE_METHODS:
                 continue
 
             node.is_dead = True

@@ -20,6 +20,7 @@ class SymbolInfo:
     content: str
     signature: str = ""
     class_name: str = ""  # for methods: the owning class
+    namespace: str = ""  # PHP namespace (e.g. "App\\Services")
     decorators: list[str] = field(default_factory=list)  # e.g. ["staticmethod", "server.list_tools"]
 
 @dataclass
@@ -61,6 +62,9 @@ class ParseResult:
         default_factory=list
     )  # (class_name, kind, parent_name) where kind is "extends" or "implements"
     exports: list[str] = field(default_factory=list)  # names from __all__ or export statements
+    variable_types: dict[str, list[str]] = field(
+        default_factory=dict
+    )  # var_name -> [ClassName, ...] inferred from factory return types
 
 class LanguageParser(ABC):
     """Base interface for language-specific parsers."""
